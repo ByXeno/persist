@@ -70,7 +70,15 @@ uint32_t get_types_size
     return total;
 }
 
-#if 1
+uint32_t get_str_count
+(persist_field_t* types,uint32_t count)
+{
+    uint32_t total = 0;
+    for(uint32_t i = 0;i < count;++i)
+    {if(types[i].type == type_str) {total++;}}
+    return total;
+}
+
 typedef struct {
     char* ptr;
     char* data;
@@ -88,8 +96,8 @@ void write_struct
     uint32_t size_of_all = get_types_size(types,count);
     char *buf = malloc(size_of_all + SIG_TOTAL_SIZE);
     if (!buf) { perror("malloc"); exit(1); }
-    str_data *str_all = malloc(count * sizeof(str_data));
-    if (!str_all) { free(str_all);perror("malloc"); exit(1); }
+    str_data *str_all = malloc(get_str_count(types,count) * sizeof(str_data));
+    if (!str_all) { free(buf);perror("malloc"); exit(1); }
     uint32_t str_ptrs_c = 0;
     char* ptr = buf;
     memcpy(ptr,&sig_front,sizeof(SIG_FRONT));
@@ -144,74 +152,73 @@ void write_struct
     free(str_all);
 }
 
-void read_struct
-(void* src,persist_field_t* types,uint32_t count,FILE* fptr)
-{}
-
-#else
+typedef struct {
+    uint32_t len;
+    char** ptr;
+} read_str;
 
 void read_struct
 (void* src,persist_field_t* types,uint32_t count,FILE* fptr)
 {
-    uint32_t total = 0;
     uint32_t i = 0;
-    for(;i < count;i++)
-    {
-        switch(types[i].type)
-        {
-            case type_bool: total += sizeof(bool);break;
-            case type_f64:
-            case type_i64:
-            case type_u64: total += sizeof(int64_t);break;
-            case type_i32:
-            case type_u32:
-            case type_f32: total += sizeof(int32_t);break;
-            case type_i16:
-            case type_u16: total += sizeof(int16_t);break;
-            case type_i8:
-            case type_u8: total += sizeof(int8_t);break;
-            case type_str: continue; {
-                fprintf(stderr, "type_str not implemented yet\n");
-                exit(1);
-            } break;
-            default: {
-                fprintf(stderr, "Unknown type: %d\n", types[i].type);
-                exit(1);
-            } break;
-        }
-    }
-    char* buf = malloc(total+1);
-    fread(buf,sizeof(char),total,fptr);
+    uint32_t size_of_all = get_types_size(types,count);
+    char *buf = malloc(size_of_all + SIG_TOTAL_SIZE);
+    if (!buf) { perror("malloc"); exit(1); }
+    fread(buf,sizeof(char),size_of_all + SIG_TOTAL_SIZE,fptr);
+    char* ptr = buf;
     void* cur = 0;
-    uint32_t x = 0;
-    uint32_t size = 0;
-    for(i = 0;i < count;i++)
+    uint32_t off = 0;
+    uint32_t str_len = 0;
+    uint32_t str_all_c = 0;
+    read_str *str_all = malloc(get_str_count(types,count) * sizeof(read_str));
+    if (!str_all) { free(buf);perror("malloc"); exit(1); }
+    if((*(int64_t*)ptr) != (int64_t)SIG_FRONT) {exit(1);}
+    ptr += sizeof(int64_t);
+    for(;i < count;++i)
     {
         cur = (char*)src+types[i].off;
         switch(types[i].type)
         {
-            case type_bool: size = sizeof(bool);break;
-            case type_f64:
+            case type_bool: (*(bool*)cur) = *ptr;ptr += sizeof(bool);break;
             case type_i64:
-            case type_u64: size = sizeof(int64_t);break;
+            case type_u64:
+            case type_f64: (*(int64_t*)cur) = *(int64_t*)ptr;ptr += sizeof(int64_t);break;
+            case type_f32:
             case type_i32:
-            case type_u32:
-            case type_f32: size = sizeof(int32_t);break;
+            case type_u32: (*(int32_t*)cur) = *(int32_t*)ptr;ptr += sizeof(int32_t);break;
             case type_i16:
-            case type_u16: size = sizeof(int16_t);break;
+            case type_u16: (*(int16_t*)cur) = *(int16_t*)ptr;ptr += sizeof(int16_t);break;
             case type_i8:
-            case type_u8: size = sizeof(int8_t);break;
-            case type_str: continue;
+            case type_u8: (*(int8_t*)cur) = *(int8_t*)ptr;ptr += sizeof(int8_t);break;
+            case type_str: {
+                uint64_t val = *(uint64_t*)ptr;
+                ptr += sizeof(int64_t);
+                if(!val) {(*(char**)cur) = 0;}
+                else {
+                    str_len += (val >> 32) + 1;
+                    str_all[str_all_c].len = (val >> 32);
+                    str_all[str_all_c++].ptr = ((char**)cur);
+                }
+            } break;
             default: {
                 fprintf(stderr, "Unknown type: %d\n", types[i].type);
                 exit(1);
             } break;
         }
-        memcpy(cur,buf+x,size);
-        x+=size;
+    }
+    if((*(int64_t*)ptr) != (int64_t)SIG_BACK) {exit(1);}
+    ptr += sizeof(int64_t);
+    free(buf);
+    buf = malloc(str_len);
+    if (!buf) { free(str_all);perror("malloc"); exit(1); }
+    fread(buf,sizeof(char),str_len,fptr);
+    for(i = 0;i < str_all_c;++i)
+    {
+        *(str_all[i].ptr) = strdup(buf + off);
+        off += str_all[i].len;
     }
     free(buf);
+    free(str_all);
 }
-#endif
 
 #endif // PERSIST_IMPLEMENTATION
