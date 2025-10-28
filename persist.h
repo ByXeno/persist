@@ -23,6 +23,16 @@ typedef enum {
     type_str,
 } persist_type_t;
 
+typedef enum {
+    success = 0,
+    malloc_failed,
+    fread_failed,
+    fwrite_failed,
+    front_sig_diff,
+    back_sig_diff,
+    unknown_type,
+} persist_error_code_t;
+
 typedef struct {
     persist_type_t type;
     uint32_t off;
@@ -32,12 +42,15 @@ typedef struct {
 #define offsetof(type,member) ((size_t)&(((type *)0)->member))
 #endif // offsetof
 
-void write_struct(void* src,persist_field_t* types,uint32_t count,FILE* fptr);
-void read_struct(void* src,persist_field_t* types,uint32_t count,FILE* fptr);
+bool persist_write_struct(void* src,persist_field_t* types,uint32_t count,FILE* fptr);
+bool persist_read_struct(void* src,persist_field_t* types,uint32_t count,FILE* fptr);
+void persist_error_write(void);
 
 #define SIG_FRONT (uint64_t)0xDEADBEEFCAFEBABE
 #define SIG_BACK  (uint64_t)0xBEEFABADFEEDFACE
 #define SIG_TOTAL_SIZE (sizeof(uint64_t)*2)
+
+static persist_error_code_t error_code;
 
 #endif // PERSIST_H_
 
@@ -84,7 +97,7 @@ typedef struct {
     char* data;
 } str_data;
 
-void write_struct
+bool persist_write_struct
 (void* src,persist_field_t* types,uint32_t count,FILE* fptr)
 {
     uint32_t i = 0;
@@ -95,9 +108,9 @@ void write_struct
     uint64_t sig_front = SIG_FRONT;
     uint32_t size_of_all = get_types_size(types,count);
     char *buf = malloc(size_of_all + SIG_TOTAL_SIZE);
-    if (!buf) { perror("malloc"); exit(1); }
+    if (!buf) { error_code = malloc_failed;return false; }
     str_data *str_all = malloc(get_str_count(types,count) * sizeof(str_data));
-    if (!str_all) { free(buf);perror("malloc"); exit(1); }
+    if (!str_all) { free(buf);error_code = malloc_failed;return false; }
     uint32_t str_ptrs_c = 0;
     char* ptr = buf;
     memcpy(ptr,&sig_front,sizeof(SIG_FRONT));
@@ -129,7 +142,7 @@ void write_struct
                 }
                 ptr += size;
             } continue;
-            default:{fprintf(stderr,"Unknown type!\n");exit(1);}
+            default:{error_code = unknown_type;return false;}
         }
         memcpy(ptr,cur,size);
         ptr += size;
@@ -143,13 +156,18 @@ void write_struct
         memcpy(str_all[i].ptr,&data,sizeof(uint64_t));
         str_off += len;
     }
-    fwrite(buf,1,size_of_all + SIG_TOTAL_SIZE,fptr);
+    if(size_of_all + SIG_TOTAL_SIZE >
+    fwrite(buf,1,size_of_all + SIG_TOTAL_SIZE,fptr))
+    {error_code = fwrite_failed;return false;}
     for(i = 0;i < str_ptrs_c;++i)
     {
-        fwrite(str_all[i].data,1,strlen(str_all[i].data) + 1,fptr);
+        if(strlen(str_all[i].data) + 1 >
+        fwrite(str_all[i].data,1,strlen(str_all[i].data) + 1,fptr))
+        {error_code = fwrite_failed;return false;}
     }
     free(buf);
     free(str_all);
+    return true;
 }
 
 typedef struct {
@@ -157,22 +175,24 @@ typedef struct {
     char** ptr;
 } read_str;
 
-void read_struct
+bool persist_read_struct
 (void* src,persist_field_t* types,uint32_t count,FILE* fptr)
 {
     uint32_t i = 0;
     uint32_t size_of_all = get_types_size(types,count);
     char *buf = malloc(size_of_all + SIG_TOTAL_SIZE);
-    if (!buf) { perror("malloc"); exit(1); }
-    fread(buf,sizeof(char),size_of_all + SIG_TOTAL_SIZE,fptr);
+    if (!buf) { error_code = malloc_failed;return false; }
+    if(0 == fread(buf,sizeof(char),size_of_all + SIG_TOTAL_SIZE,fptr))
+    { error_code = fread_failed;return false;}
     char* ptr = buf;
     void* cur = 0;
     uint32_t off = 0;
     uint32_t str_len = 0;
     uint32_t str_all_c = 0;
     read_str *str_all = malloc(get_str_count(types,count) * sizeof(read_str));
-    if (!str_all) { free(buf);perror("malloc"); exit(1); }
-    if((*(int64_t*)ptr) != (int64_t)SIG_FRONT) {exit(1);}
+    if (!str_all) { free(buf);error_code = malloc_failed;return false; }
+    if((*(int64_t*)ptr) != (int64_t)SIG_FRONT)
+    { error_code = front_sig_diff;return false; }
     ptr += sizeof(int64_t);
     for(;i < count;++i)
     {
@@ -200,18 +220,17 @@ void read_struct
                     str_all[str_all_c++].ptr = ((char**)cur);
                 }
             } break;
-            default: {
-                fprintf(stderr, "Unknown type: %d\n", types[i].type);
-                exit(1);
-            } break;
+            default:error_code = unknown_type;return false;
         }
     }
-    if((*(int64_t*)ptr) != (int64_t)SIG_BACK) {exit(1);}
+    if((*(int64_t*)ptr) != (int64_t)SIG_BACK)
+    { error_code = back_sig_diff;return false; }
     ptr += sizeof(int64_t);
     free(buf);
     buf = malloc(str_len);
-    if (!buf) { free(str_all);perror("malloc"); exit(1); }
-    fread(buf,sizeof(char),str_len,fptr);
+    if (!buf) { free(str_all);error_code = malloc_failed;return false; }
+    if(0 == fread(buf,sizeof(char),str_len,fptr))
+    { error_code = fread_failed; return false;}
     for(i = 0;i < str_all_c;++i)
     {
         *(str_all[i].ptr) = strdup(buf + off);
@@ -219,6 +238,37 @@ void read_struct
     }
     free(buf);
     free(str_all);
+    return true;
+}
+
+void persist_error_write
+(void)
+{
+    switch(error_code)
+    {
+        case success: return;
+        case malloc_failed:
+            fprintf(stderr, "Persist error: malloc function failed!\n");
+            return;
+        case fread_failed:
+            fprintf(stderr, "Persist error: fread failed to read from file!\n");
+            return;
+        case fwrite_failed:
+            fprintf(stderr, "Persist error: fwrite failed to write to file!\n");
+            return;
+        case front_sig_diff:
+            fprintf(stderr, "Persist error: front signature mismatch!\n");
+            return;
+        case back_sig_diff:
+            fprintf(stderr, "Persist error: back signature mismatch!\n");
+            return;
+        case unknown_type:
+            fprintf(stderr, "Persist error: unknown type encountered!\n");
+            return;
+        default:
+            fprintf(stderr, "Persist error: unknown error code: %d\n", error_code);
+            return;
+    }
 }
 
 #endif // PERSIST_IMPLEMENTATION
