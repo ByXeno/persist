@@ -31,8 +31,9 @@ typedef enum {
     fwrite_failed,
     front_sig_diff,
     back_sig_diff,
+    misalign,
     unknown_type,
-} persist_error_code_t;
+} persist_ec_t;
 
 typedef struct {
     persist_type_t type;
@@ -43,9 +44,13 @@ typedef struct {
 #  define offsetof(type,member) ((size_t)&(((type *)0)->member))
 #endif
 
-bool persist_write_struct(void* src, persist_field_t* types, uint32_t count, FILE* fptr);
-bool persist_read_struct(void* src, persist_field_t* types, uint32_t count, FILE* fptr);
-void persist_error_write(void);
+persist_ec_t persist_write_struct(void* src, persist_field_t* types, uint32_t count, FILE* fptr);
+persist_ec_t persist_serialize_struct
+(void* src, persist_field_t* types, uint32_t count,char** out,uint32_t* out_len);
+persist_ec_t persist_deserialize_struct
+(void* src, persist_field_t* types, uint32_t count,char* buf);
+persist_ec_t persist_read_struct(void* src, persist_field_t* types, uint32_t count, FILE* fptr);
+void persist_error_write(persist_ec_t error_code);
 
 #ifndef SIG_TYPE
 #   define SIG_TYPE uint64_t
@@ -61,7 +66,7 @@ void persist_error_write(void);
 
 #define SIG_TOTAL_SIZE (sizeof(SIG_TYPE) * 2)
 
-static persist_error_code_t error_code = success;
+//static persist_ec_t error_code = success;
 
 #endif // PERSIST_H_
 
@@ -104,6 +109,23 @@ static uint32_t get_str_count(persist_field_t* types, uint32_t count)
     return total;
 }
 
+static uint32_t get_str_total_len
+(void* src,persist_field_t* types, uint32_t count)
+{
+    uint32_t total = 0;
+    char* cur = 0;
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        if (types[i].type == type_str)
+        {
+            cur = (char*)src + types[i].off;
+            total += strlen(cur)+1;
+        }
+    }
+    return total;
+}
+
+
 /* ptr_in_buf:location in the metadata buffer where the 64-bit (len<<32 | offset) lives */
 /* src:actual C-string pointer from the struct */
 typedef struct {
@@ -118,25 +140,26 @@ typedef struct {
     char** dst;
 } str_data_read;
 
-/* ----------------- Write implementation ----------------- */
+/* ----------------- Serialize implementation ----------------- */
 
-bool persist_write_struct
-(void* src, persist_field_t* types, uint32_t count, FILE* fptr)
+persist_ec_t persist_serialize_struct
+(void* src, persist_field_t* types, uint32_t count, char** out,uint32_t* out_len)
 {
-    if (!src || !types || !fptr) { error_code = got_null_pointer; return false; }
-    uint32_t size_of_all = get_types_size(types, count);
-    size_t meta_bytes = (size_t)size_of_all + SIG_TOTAL_SIZE;
-    char* meta = (char*)malloc(meta_bytes);
-    if (!meta) { error_code = malloc_failed; return false; }
-    memset(meta, 0, meta_bytes);
+    persist_ec_t error_code = success;
+    if(!src || !types || !out || !out_len) { error_code = got_null_pointer; goto error;}
+    uint32_t str_total_len = get_str_total_len(src,types,count);
+    uint32_t size_of_meta = get_types_size(types,count);
+    *out_len = size_of_meta + str_total_len + SIG_TOTAL_SIZE;
+    char* data = (char*)calloc(*out_len,sizeof(char));
+    if (!data) { error_code = malloc_failed; goto error; }
     uint32_t str_count = get_str_count(types, count);
-    str_data_write* strlist = NULL;
+    str_data_write* strlist = 0;
     if (str_count)
     {
-        strlist = (str_data_write*)malloc(sizeof(str_data_write) * str_count);
-        if (!strlist) { free(meta); error_code = malloc_failed; return false; }
+        strlist = (str_data_write*)calloc(sizeof(str_data_write) * str_count,sizeof(char));
+        if (!strlist) { error_code = malloc_failed; goto error; }
     }
-    char* ptr = meta;
+    char* ptr = data;
     SIG_TYPE sig_front = SIG_FRONT;
     SIG_TYPE sig_back = SIG_BACK;
     memcpy(ptr, &sig_front, sizeof(SIG_TYPE));
@@ -180,55 +203,71 @@ bool persist_write_struct
                 continue; /* already handled advancing ptr */
             }
             default:
-                free(meta);
-                free(strlist);
                 error_code = unknown_type;
-                return false;
+                goto error;
         }
         memcpy(ptr, cur, elem_size);
         ptr += elem_size;
     }
     /* sig_back */
     memcpy(ptr, &sig_back, sizeof(SIG_TYPE));
-    /* Done filling meta buffer */
-    /* Now fill string descriptors (len and offsets) */
+    ptr+=sizeof(SIG_TYPE);
+    if(ptr != data+size_of_meta+SIG_TOTAL_SIZE)
+    {
+        error_code = misalign;
+        goto error;
+    }
     for (uint32_t i = 0; i < str_idx; ++i)
     {
         uint64_t len = (uint64_t)(strlen(strlist[i].src) + 1); /* include NUL */
         uint64_t packed = ((len << 32) | (uint64_t)str_off);
         memcpy(strlist[i].ptr_in_buf, &packed, sizeof(packed));
         str_off += (uint32_t)len;
+        memcpy(ptr,strlist[i].src,len);
+        ptr += len;
     }
-    /* Write meta buffer */
-    size_t written_meta = fwrite(meta, 1, meta_bytes, fptr);
-    if (written_meta != meta_bytes) {
-        error_code = fwrite_failed;
-        free(meta);
-        free(strlist);
-        return false;
-    }
-    /* Write actual string data, in order */
-    for (uint32_t i = 0; i < str_idx; ++i)
-    {
-        size_t len = strlen(strlist[i].src) + 1;
-        size_t written = fwrite(strlist[i].src, 1, len, fptr);
-        if (written != len) {
-            error_code = fwrite_failed;
-            free(meta);
-            free(strlist);
-            return false;
-        }
-    }
-    free(meta);
+    /* Done filling meta buffer */
+    /* Now fill string descriptors (len and offsets) */
+    *out = data;
     free(strlist);
-    error_code = success;
-    return true;
+    return success;
+error:
+    *out = 0;
+    *out_len = 0;
+    if(data) {free(data);}
+    if(strlist) {free(strlist);}
+    return error_code;
+}
+
+/* ----------------- Deserialize implementation ----------------- */
+
+persist_ec_t persist_deserialize_struct
+(void* src, persist_field_t* types, uint32_t count,char* buf)
+{
+
+}
+
+/* ----------------- Cross Write implementation ----------------- */
+
+persist_ec_t persist_write_struct
+(void* src, persist_field_t* types, uint32_t count, FILE* fptr)
+{
+    persist_ec_t ec = success;
+    char* out = 0;
+    uint32_t out_len = 0;
+    ec = persist_serialize_struct(src,types,count,&out,&out_len);
+    if(ec) return ec;
+    size_t written = fwrite(out,1,out_len,fptr);
+    if (written != out_len) ec = fwrite_failed;
+    free(out);
+    return ec;
 }
 
 /* ----------------- Read implementation ----------------- */
 
-bool persist_read_struct(void* src, persist_field_t* types, uint32_t count, FILE* fptr)
+persist_ec_t persist_read_struct(void* src, persist_field_t* types, uint32_t count, FILE* fptr)
 {
+    persist_ec_t error_code = success;
     if (!src || !types || !fptr) { error_code = got_null_pointer; return false; }
     uint32_t size_of_all = get_types_size(types, count);
     size_t meta_bytes = (size_t)size_of_all + SIG_TOTAL_SIZE;
@@ -381,7 +420,7 @@ bool persist_read_struct(void* src, persist_field_t* types, uint32_t count, FILE
 
 /* ----------------- Error reporting ----------------- */
 
-void persist_error_write(void)
+void persist_error_write(persist_ec_t error_code)
 {
     switch (error_code)
     {
