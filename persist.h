@@ -32,6 +32,7 @@ typedef enum {
     front_sig_diff,
     back_sig_diff,
     misalign,
+    buffer_too_small,
     unknown_type,
 } persist_ec_t;
 
@@ -40,16 +41,18 @@ typedef struct {
     uint32_t off;
 } persist_field_t;
 
-#ifndef offsetof
-#  define offsetof(type,member) ((size_t)&(((type *)0)->member))
-#endif
+persist_ec_t persist_write_struct
+(void* src, persist_field_t* types, uint32_t count, FILE* fptr);
 
-persist_ec_t persist_write_struct(void* src, persist_field_t* types, uint32_t count, FILE* fptr);
 persist_ec_t persist_serialize_struct
 (void* src, persist_field_t* types, uint32_t count,char** out,uint32_t* out_len);
+
 persist_ec_t persist_deserialize_struct
-(void* src, persist_field_t* types, uint32_t count,char* buf);
-persist_ec_t persist_read_struct(void* src, persist_field_t* types, uint32_t count, FILE* fptr);
+(void* src, persist_field_t* types, uint32_t count,char* buf,uint32_t buf_len);
+
+persist_ec_t persist_read_struct
+(void* src, persist_field_t* types, uint32_t count, FILE* fptr);
+
 void persist_error_write(persist_ec_t error_code);
 
 #ifndef SIG_TYPE
@@ -65,8 +68,6 @@ void persist_error_write(persist_ec_t error_code);
 #endif
 
 #define SIG_TOTAL_SIZE (sizeof(SIG_TYPE) * 2)
-
-//static persist_ec_t error_code = success;
 
 #endif // PERSIST_H_
 
@@ -156,7 +157,7 @@ persist_ec_t persist_serialize_struct
     str_data_write* strlist = 0;
     if (str_count)
     {
-        strlist = (str_data_write*)calloc(sizeof(str_data_write) * str_count,sizeof(char));
+        strlist = (str_data_write*)calloc(str_count,sizeof(str_data_write));
         if (!strlist) { error_code = malloc_failed; goto error; }
     }
     char* ptr = data;
@@ -242,9 +243,129 @@ error:
 /* ----------------- Deserialize implementation ----------------- */
 
 persist_ec_t persist_deserialize_struct
-(void* src, persist_field_t* types, uint32_t count,char* buf)
+(void* src, persist_field_t* types, uint32_t count,char* buf, uint32_t buf_len)
 {
-
+    persist_ec_t error_code = success;
+    if (!src || !types || !buf) { error_code = got_null_pointer; goto error; }
+    const char* ptr = buf;
+    /* --- Check front signature --- */
+    if ((size_t)(ptr - buf) + sizeof(SIG_TYPE) > buf_len) {
+        error_code = buffer_too_small;
+        goto error;
+    }
+    SIG_TYPE read_sig_front = 0;
+    memcpy(&read_sig_front, ptr, sizeof(SIG_TYPE));
+    if (read_sig_front != SIG_FRONT) {
+        error_code = front_sig_diff;
+        goto error;
+    }
+    ptr += sizeof(SIG_TYPE);
+    /* --- Prepare to collect string targets --- */
+    uint32_t str_count = get_str_count(types, count);
+    str_data_read* strlist = NULL;
+    if (str_count) {
+        strlist = (str_data_read*)malloc(sizeof(str_data_read) * str_count);
+        if (!strlist) { error_code = malloc_failed; goto error; }
+    }
+    uint32_t str_idx = 0;
+    uint64_t total_strings_bytes = 0;
+    #define check_size(type) \
+    if ((size_t)(ptr - buf) + sizeof(type) > buf_len) { error_code = buffer_too_small; goto error; } \
+    memcpy(cur, ptr, sizeof(type)); \
+    ptr += sizeof(type);
+    /* --- Read fields --- */
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        void* cur = (char*)src + types[i].off;
+        switch (types[i].type)
+        {
+            case type_bool:
+                check_size(bool);
+                break;
+            case type_i64:
+            case type_u64:
+            case type_f64:
+                check_size(uint64_t);
+                break;
+            case type_f32:
+            case type_i32:
+            case type_u32:
+                check_size(uint32_t);
+                break;
+            case type_i16:
+            case type_u16:
+                check_size(uint16_t);
+                break;
+            case type_i8:
+            case type_u8:
+                check_size(uint8_t);
+                break;
+            case type_str:
+            {
+                if ((size_t)(ptr - buf) + sizeof(uint64_t) > buf_len)
+                { error_code = buffer_too_small; goto error; }
+                uint64_t packed = 0;
+                memcpy(&packed, ptr, sizeof(uint64_t));
+                ptr += sizeof(uint64_t);
+                if (packed == 0) {
+                    *(char**)cur = NULL;
+                } else {
+                    uint32_t len = (uint32_t)(packed >> 32);
+                    strlist[str_idx].len = len;
+                    strlist[str_idx].dst = (char**)cur;
+                    total_strings_bytes += len;
+                    ++str_idx;
+                }
+            } break;
+            default:
+                error_code = unknown_type;
+                goto error;
+        }
+    }
+    /* --- Check back signature --- */
+    if ((size_t)(ptr - buf) + sizeof(SIG_TYPE) > buf_len) {
+        error_code = buffer_too_small;
+        goto error;
+    }
+    SIG_TYPE read_sig_back = 0;
+    memcpy(&read_sig_back, ptr, sizeof(SIG_TYPE));
+    if (read_sig_back != SIG_BACK) {
+        error_code = back_sig_diff;
+        goto error;
+    }
+    ptr += sizeof(SIG_TYPE);
+    /* --- Read strings --- */
+    if (total_strings_bytes > 0)
+    {
+        for (uint32_t i = 0; i < str_idx; ++i)
+        {
+            if ((size_t)(ptr - buf) + strlist[i].len > buf_len) {
+                error_code = buffer_too_small;
+                goto error;
+            }
+            *(strlist[i].dst) = (char*)malloc(strlist[i].len);
+            if (!*(strlist[i].dst)) {
+                error_code = malloc_failed;
+                goto error;
+            }
+            memcpy(*(strlist[i].dst), ptr, strlist[i].len);
+            ptr += strlist[i].len;
+        }
+    }
+    free(strlist);
+    return error_code;
+error:
+    if (strlist)
+    {
+        for (uint32_t i = 0; i < str_idx; ++i) {
+            if (strlist[i].dst && *(strlist[i].dst)) {
+                free(*(strlist[i].dst));
+                *(strlist[i].dst) = NULL;
+            }
+        }
+        free(strlist);
+    }
+    return error_code;
 }
 
 /* ----------------- Cross Write implementation ----------------- */
@@ -263,159 +384,31 @@ persist_ec_t persist_write_struct
     return ec;
 }
 
-/* ----------------- Read implementation ----------------- */
+/* ----------------- Cross Read implementation ----------------- */
 
-persist_ec_t persist_read_struct(void* src, persist_field_t* types, uint32_t count, FILE* fptr)
+persist_ec_t persist_read_struct
+(void* dst, persist_field_t* types, uint32_t count, FILE* fptr)
 {
+    if (!dst || !types || !fptr) return got_null_pointer;
     persist_ec_t error_code = success;
-    if (!src || !types || !fptr) { error_code = got_null_pointer; return false; }
-    uint32_t size_of_all = get_types_size(types, count);
-    size_t meta_bytes = (size_t)size_of_all + SIG_TOTAL_SIZE;
-    char* meta = (char*)malloc(meta_bytes);
-    if (!meta) { error_code = malloc_failed; return false; }
-    /* Read metadata */
-    size_t read_meta = fread(meta, 1, meta_bytes, fptr);
-    if (read_meta != meta_bytes) {
-        error_code = fread_failed;
-        free(meta);
-        return false;
+    /* --- Determine file size --- */
+    if (fseek(fptr, 0, SEEK_END) != 0) return fread_failed;
+    long file_size = ftell(fptr);
+    if (file_size < 0) return fread_failed;
+    rewind(fptr);
+    /* --- Allocate buffer --- */
+    char* buf = (char*)malloc((size_t)file_size);
+    if (!buf) return malloc_failed;
+    /* --- Read all bytes --- */
+    size_t read_bytes = fread(buf, 1, (size_t)file_size, fptr);
+    if (read_bytes != (size_t)file_size) {
+        free(buf);
+        return fread_failed;
     }
-    char* ptr = meta;
-    /* Check front sig */
-    SIG_TYPE read_sig_front = 0;
-    memcpy(&read_sig_front, ptr, sizeof(SIG_TYPE));
-    if (read_sig_front != SIG_FRONT) {
-        error_code = front_sig_diff;
-        free(meta);
-        return false;
-    }
-    ptr += sizeof(SIG_TYPE);
-    /* Prepare to collect string targets */
-    uint32_t str_count = get_str_count(types, count);
-    str_data_read* strlist = NULL;
-    if (str_count) {
-        strlist = (str_data_read*)malloc(sizeof(str_data_read) * str_count);
-        if (!strlist) { free(meta); error_code = malloc_failed; return false; }
-    }
-    uint32_t str_idx = 0;
-    uint64_t total_strings_bytes = 0;
-    for (uint32_t i = 0; i < count; ++i)
-    {
-        void* cur = (char*)src + types[i].off;
-        switch (types[i].type)
-        {
-            case type_bool:
-            {
-                bool v;
-                memcpy(&v, ptr, sizeof(bool));
-                memcpy(cur, &v, sizeof(bool));
-                ptr += sizeof(bool);
-            } break;
-            case type_i64:
-            case type_u64:
-            case type_f64:
-            {
-                uint64_t v;
-                memcpy(&v, ptr, sizeof(uint64_t));
-                memcpy(cur, &v, sizeof(uint64_t));
-                ptr += sizeof(uint64_t);
-            } break;
-            case type_f32:
-            case type_i32:
-            case type_u32:
-            {
-                uint32_t v;
-                memcpy(&v, ptr, sizeof(uint32_t));
-                memcpy(cur, &v, sizeof(uint32_t));
-                ptr += sizeof(uint32_t);
-            } break;
-            case type_i16:
-            case type_u16:
-            {
-                uint16_t v;
-                memcpy(&v, ptr, sizeof(uint16_t));
-                memcpy(cur, &v, sizeof(uint16_t));
-                ptr += sizeof(uint16_t);
-            } break;
-            case type_i8:
-            case type_u8:
-            {
-                uint8_t v;
-                memcpy(&v, ptr, sizeof(uint8_t));
-                memcpy(cur, &v, sizeof(uint8_t));
-                ptr += sizeof(uint8_t);
-            } break;
-            case type_str:
-            {
-                uint64_t packed = 0;
-                memcpy(&packed, ptr, sizeof(uint64_t));
-                ptr += sizeof(uint64_t);
-                if (packed == 0) {
-                    /* NULL pointer */
-                    *(char**)cur = NULL;
-                } else {
-                    uint32_t len = (uint32_t)(packed >> 32);
-                    /* len includes NUL, since writer stored strlen+1 */
-                    /* store destination pointer location and len to fill later */
-                    strlist[str_idx].len = len;
-                    strlist[str_idx].dst = (char**)cur;
-                    total_strings_bytes += len;
-                    ++str_idx;
-                }
-            } break;
-            default:
-                free(meta);
-                free(strlist);
-                error_code = unknown_type;
-                return false;
-        }
-    }
-    /* Check back sig */
-    SIG_TYPE read_sig_back = 0;
-    memcpy(&read_sig_back, ptr, sizeof(SIG_TYPE));
-    if (read_sig_back != SIG_BACK) {
-        error_code = back_sig_diff;
-        free(meta);
-        free(strlist);
-        return false;
-    }
-    /* read string block (if any) */
-    free(meta);
-    if (total_strings_bytes > 0)
-    {
-        char* sblock = (char*)malloc((size_t)total_strings_bytes);
-        if (!sblock) { free(strlist); error_code = malloc_failed; return false; }
-        size_t read_s = fread(sblock, 1, (size_t)total_strings_bytes, fptr);
-        if (read_s != (size_t)total_strings_bytes) {
-            free(sblock);
-            free(strlist);
-            error_code = fread_failed;
-            return false;
-        }
-        /* Fill the pointers in order (they were written in the same order) */
-        uint32_t offset = 0;
-        for (uint32_t i = 0; i < str_idx; ++i)
-        {
-            /* Duplicate string into heap for caller */
-            char* dup = strdup(sblock + offset);
-            if (!dup) {
-                /* If strdup fails, free previous allocations and abort */
-                for (uint32_t j = 0; j < i; ++j) {
-                    free(*(strlist[j].dst)); /* those were strdup'ed */
-                }
-                free(sblock);
-                free(strlist);
-                error_code = malloc_failed;
-                return false;
-            }
-            *(strlist[i].dst) = dup;
-            offset += strlist[i].len; /* len includes NUL */
-        }
-        free(sblock);
-    }
-    free(strlist);
-    error_code = success;
-    return true;
+    /* --- Call main deserializer --- */
+    error_code = persist_deserialize_struct(dst, types, count, buf, (uint32_t)file_size);
+    free(buf);
+    return error_code;
 }
 
 /* ----------------- Error reporting ----------------- */
@@ -443,13 +436,19 @@ void persist_error_write(persist_ec_t error_code)
         case back_sig_diff:
             fprintf(stderr, "Persist error: back signature mismatch!\n");
             return;
+        case misalign:
+            fprintf(stderr, "Persist error: buffer is misaligned!\n");
+            return;
+        case buffer_too_small:
+            fprintf(stderr, "Persist error: buffer is too small for given types!\n");
+            return;
         case unknown_type:
             fprintf(stderr, "Persist error: unknown type encountered!\n");
             return;
         default:
             fprintf(stderr, "Persist error: unknown error code: %d\n", (int)error_code);
             return;
-    }
+        }
 }
 
 #endif /* PERSIST_IMPLEMENTATION */
