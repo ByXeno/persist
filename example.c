@@ -24,7 +24,7 @@ int main(void)
     user_t u1 = {
         .id = 42,
         .score = 99.7,
-        .name = "Fanes",
+        .name = "Hans",
         .active = true,
     };
 
