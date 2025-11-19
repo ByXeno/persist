@@ -26,7 +26,7 @@ typedef enum {
 } persist_type_t;
 
 typedef enum {
-    success = 0,
+    persist_success = 0,
     got_null_pointer,
     null_with_count,
     malloc_failed,
@@ -171,7 +171,7 @@ static uint32_t get_total_size
 persist_ec_t persist_write_struct
 (void* src, persist_field_t* types, uint32_t count, FILE* fptr)
 {
-    persist_ec_t ec = success;
+    persist_ec_t ec = persist_success;
     char* out = 0;
     uint32_t out_len = 0;
     ec = persist_serialize_struct(src,types,count,&out,&out_len);
@@ -189,10 +189,9 @@ persist_ec_t persist_write_struct
 persist_ec_t persist_serialize_struct
 (void* src, persist_field_t* types, uint32_t count, char** out,count_t* out_len)
 {
-    persist_ec_t error_code = success;
+    persist_ec_t error_code = persist_success;
     if(!src || !types || !out || !out_len) { error_code = got_null_pointer; goto error;}
     *out_len = get_total_size(src,types,count);
-    printf("total: %d\n",*out_len);
     char* data = (char*)calloc(*out_len,sizeof(char));
     if (!data) { error_code = malloc_failed; goto error; }
     char* ptr = data;
@@ -258,9 +257,8 @@ persist_ec_t persist_serialize_struct
         write_buf(cur,elem_size);
     }
     write_buf(&sig_back,sizeof(SIG_TYPE));
-    printf("writed: %d\n",(ptr-data));
     if((ptr-data) != *out_len)
-    {printf("misalign size:%d\n",*out_len-(ptr-data));error_code = misalign;goto error;}
+    {fprintf(stderr,"misalign size:%d\n",*out_len-(ptr-data));error_code = misalign;goto error;}
     *out = data;
     return error_code;
 error:
@@ -281,7 +279,7 @@ error:
 persist_ec_t persist_deserialize_struct
 (void* src, persist_field_t* types, uint32_t count,char* buf, uint32_t buf_len)
 {
-    persist_ec_t error_code = success;
+    persist_ec_t error_code = persist_success;
     if (!src || !types || !buf) { error_code = got_null_pointer; goto error; }
     if(buf_len < sizeof(count_t) + SIG_TOTAL_SIZE) {error_code = buffer_too_small; goto error;}
     char* ptr = buf;
@@ -386,7 +384,7 @@ persist_ec_t persist_read_struct
 (void* dst, persist_field_t* types, uint32_t count, FILE* fptr)
 {
     if (!dst || !types || !fptr) return got_null_pointer;
-    persist_ec_t error_code = success;
+    persist_ec_t error_code = persist_success;
     if (fseek(fptr, 0, SEEK_END) != 0) return fread_failed;
     long file_size = ftell(fptr);
     if (file_size < 0) return fread_failed;
@@ -407,7 +405,7 @@ void persist_error_write(persist_ec_t error_code)
 {
     switch (error_code)
     {
-        case success: return;
+        case persist_success: return;
         case got_null_pointer:
             fprintf(stderr, "Persist error: got null pointer as a parameter!\n");
             return;
